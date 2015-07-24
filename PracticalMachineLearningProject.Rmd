@@ -1,0 +1,146 @@
+---
+title: "Coursera Practical Machine Learning Project"
+author: "Mark S."
+date: "Wednesday, July 22, 2015"
+output: html_document
+---
+
+## Project Summary
+The goal of this project is to build a model that can predict the manner in which an exercise is being performed. We are given two sets of data, a training set and a test set. The source and description of the data is found here: http://groupware.les.inf.puc-rio.br/har. The data can be downloaded via the following links:
+
+Training: https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv
+
+Testing: https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv
+
+## Data Overview and Strategy
+My interpretation of the problem is as follows: "Given a set of measurements *in this moment*, predict how the exercise is being performed by any person *in this moment*."
+
+The "*in this moment*" phrase is emphasized to establish the fact that we want a model that can generalize to any moment in time. We don't want to make a prediction based off of measurements that occured in the past; rather we would like to make predictions based on single measurements occuring at a single moment in time. Also, we would like a model that can generalize to any user. With this reasoning, we will ignore any variables provided that are considered "window statistics", variables involving time, and the names of the participants. This includes the first 7 variables of the data set, as well as any variable name containing min, max, avg, var, std, total, kurtosis, skewness, or amplitude.
+
+Since this is a classification task, we'll use a random forest and a gradient boosted machine. The entire process will be structured as follows:
+
+1. Remove unwanted variables (explained above)
+2. Split training data into 2 sets; call them "A" and "B" with a 70/30 split.
+3. Perform data analysis and preprocessing using data set "A"
+4. The models will be trained on set "A" using cross validation, and performance evaluated via set "B". This will give us an out of sample error estimate of the model.
+5. The final chosen model will be used to make predictions for the submission part of the assignment.
+
+## Downloading and Cleaning the Data
+First we download the data, and remove the unwanted columns, as explained previously:
+
+```{r, echo=FALSE}
+suppressWarnings(suppressMessages(library(dplyr)))
+suppressWarnings(suppressMessages(library(caret)))
+suppressWarnings(suppressMessages(library(ggplot2)))
+suppressWarnings(suppressMessages(library(RCurl)))
+
+
+```
+
+```{r}
+#Set global seed for reproducibility
+set.seed(8080)
+
+#Load the data; use library RCurl to allow download of data in knitr
+#note that some of the data contain "NA", "#DIV/0!" and empty values. These will be considered "NA"
+temp<-getURL("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv",ssl.verifypeer=0L,followlocation=1L)
+data<- tbl_df(read.csv(text=temp, na.strings = c("NA","#DIV/0!","")))
+
+temp<-getURL("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv",ssl.verifypeer=0L,followlocation=1L)
+final.test<- tbl_df(read.csv(text=temp, na.strings = c("NA","#DIV/0!","")))
+
+#remove temp variable
+rm(temp)
+
+#First 7 columns aren't measurements; they won't be included
+data<- data[,-(1:7)]
+final.test<- final.test[,-(1:7)]
+
+#Create a vector of all feature names based on time or window statistics
+feats<- grep("^min|max|avg|var|std|total|kurtosis|skewness|amplitude",names(data))
+
+#Remove these features from the data
+data<- data[,-feats]
+final.test<-final.test[,-feats]
+```
+
+Now we split the data into train and test sets with a 70/30 split.  The "final.test" set is the one we will make predictions on and submit.
+
+```{r}
+#split data into train/test sets
+n<- createDataPartition(y=data$classe,p=0.7,list=FALSE)
+train<- data[n,]
+test<- data[-n,]
+
+#convert data to tbl_df to use with dplyr
+train<- tbl_df(train)
+test<- tbl_df(test)
+
+```
+
+## Exploratory Data Analysis
+First check the dimensionality of the data:
+
+```{r}
+dim(train)
+```
+
+We've already eliminated many of the features (going from 159 to 48). We should also check to see if we have any features with near-zero variance:
+```{r}
+nearZeroVar(train)
+```
+
+It would be difficult to plot feature pairs, but we can visualze the correlations to identify variables to inspect:
+```{r,echo=FALSE, fig.width=10,fig.height=8}
+# Correlation plot, looking for correlation between variables
+library(lattice)
+library("RColorBrewer")
+
+# "PRGn" and "Spectral" work well
+brewer.div = colorRampPalette(brewer.pal(11, "PRGn"), interpolate = "spline")
+
+levelplot(cor(train[,-49]),at=do.breaks(c(-1.01,1.01),20),
+          main="Correlation Level Plot", xlab="",ylab="",aspect=1,
+          #panel=panel.corrgram.2,
+          colorkey=list(space="top"),pretty=TRUE, 
+          #col.regions=colorRampPalette(c("red","white","blue")),
+          col.regions=brewer.div(200),
+          scales=list(x=list(rot=90)))
+```
+
+Based on the correlation plot it seems that some variables are highly correlated. We can inspect some of these further; let's take a look at the variables containing "belt" (variables in the bottom left corer of the correlation plot):
+
+```{r,echo=FALSE,fig.width=10,fig.height=8}
+pairs(train[,grep("belt",names(train))])
+```
+
+We observe some strange patterns between the variables. It's not obvious which variables should be removed based on inspection, so we will keep all of them for now. Since we are using a tree-based model, more preprocessing isn't necessary. We could try to reduce dimensionality via PCA, but we will continue using the data as is for now.
+
+## Building the Models
+We'll build a random forest and gradient boosted model using 5-fold cross-validation:
+
+```{r,warning=FALSE,message=FALSE}
+
+fitControl <- trainControl(method = "cv",number = 5)
+#Build the models; number of trees was chosen to reduce the time to build the models
+mod1<- train(classe~., data = train, method = "rf",ntree= 20,trControl = fitControl, allowParallel=TRUE)
+mod2<- train(classe~., method = "gbm", data = train, trControl = fitControl, tuneGrid = expand.grid(n.trees=20, interaction.depth=2, shrinkage=0.1), verbose = FALSE)
+```
+
+Next, test the models on the test set:
+
+```{r}
+#Make predictions on the test set
+pred1<- predict(mod1,test[,-49])
+pred2<- predict(mod2,test[,-49])
+
+#Print the confusion matrix for each models predictions
+confusionMatrix(pred1,test$classe)
+confusionMatrix(pred2,test$classe)
+```
+
+The random forest performs better with an out-of-sample error estimate of approximately 0.8%. This model will be used to predict the final test set:
+
+```{r}
+predict(mod1,final.test[,-49])
+```
