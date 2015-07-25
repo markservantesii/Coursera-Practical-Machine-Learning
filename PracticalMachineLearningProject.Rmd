@@ -17,13 +17,15 @@ My interpretation of the problem is as follows: "Given a set of measurements *in
 
 The "*in this moment*" phrase is emphasized to establish the fact that we want a model that can generalize to any moment in time. We don't want to make a prediction based off of measurements that occured in the past; rather we would like to make predictions based on single measurements occuring at a single moment in time. Also, we would like a model that can generalize to any user. With this reasoning, we will ignore any variables provided that are considered "window statistics", variables involving time, and the names of the participants. This includes the first 7 variables of the data set, as well as any variable name containing min, max, avg, var, std, total, kurtosis, skewness, or amplitude.
 
-Since this is a classification task, we'll use a random forest and a gradient boosted machine. The entire process will be structured as follows:
+Since this is a classification task, we'll use a random forest model. The entire process will be structured as follows:
 
 1. Remove unwanted variables (explained above)
 2. Split training data into 2 sets; call them "A" and "B" with a 70/30 split.
 3. Perform data analysis and preprocessing using data set "A"
-4. The models will be trained on set "A" using cross validation, and performance evaluated via set "B". This will give us an out of sample error estimate of the model.
-5. The final chosen model will be used to make predictions for the submission part of the assignment.
+4. Perform feature selection using cross validation.
+5. Build a random forest with selected features; evaluate its out of sample error with the hold-out set "B"
+6. Make a prediction with the "final test" set; the data we must predict for submission.
+
 
 ## Downloading and Cleaning the Data
 First we download the data, and remove the unwanted columns, as explained previously:
@@ -79,13 +81,15 @@ test<- tbl_df(test)
 ```
 
 ## Exploratory Data Analysis
-First check the dimensionality of the data:
+First check the dimensionality of the data, and get an idea of the distribution of the classe variable:
 
 ```{r}
 dim(train)
+table(train$classe)
 ```
+The classe variable isn't perfectly balanced, but it shouldn't be enough to cause any problems.
 
-We've already eliminated many of the features (going from 159 to 48). We should also check to see if we have any features with near-zero variance:
+We've already eliminated many of the features (reducing from 159 to 48). We should also check to see if we have any features with near-zero variance:
 ```{r}
 nearZeroVar(train)
 ```
@@ -108,39 +112,61 @@ levelplot(cor(train[,-49]),at=do.breaks(c(-1.01,1.01),20),
           scales=list(x=list(rot=90)))
 ```
 
-Based on the correlation plot it seems that some variables are highly correlated. We can inspect some of these further; let's take a look at the variables containing "belt" (variables in the bottom left corer of the correlation plot):
+Based on the correlation plot it seems that only a handful of variables are highly correlated. We'll build a random forest using 10-fold cross validation to determine the most important features to use in the final model:
 
-```{r,echo=FALSE,fig.width=10,fig.height=8}
-pairs(train[,grep("belt",names(train))])
+```{r,warning=FALSE,message=FALSE}
+fitControl<- trainControl(method="cv",number=10)
+mod0<- train(classe~.,data=train, trControl= fitControl, method="rf", ntree = 20, allowParallel=TRUE)
 ```
 
-We observe some strange patterns between the variables. It's not obvious which variables should be removed based on inspection, so we will keep all of them for now. Since we are using a tree-based model, more preprocessing isn't necessary. We could try to reduce dimensionality via PCA, but we will continue using the data as is for now.
+We can plot the important features to see which ones we should keep in our final model:
 
-## Building the Models
-We'll build a random forest and gradient boosted model using 5-fold cross-validation:
+```{r}
+plot(varImp(mod0))
+```
+
+It appears we could get away using the top 10 to 15 features. We'll err on the safe side and keep the top 15 variables for the final model. We'll extract these features and prepare the data for the final model:
+
+```{r}
+#Feature Importances
+names <- rownames(varImp(mod0)$importance)
+importance <- varImp(mod0)$importance$Overall
+imps<- tbl_df(data.frame(names,importance))
+
+#Custom function to Pull out column as vector from dplyr data frame
+#Usage: pull(data,"column_name") or pull(data, column_name) or pull(data,column_number)
+pull <- function(x,y) {x[,if(is.name(substitute(y))) deparse(substitute(y)) else y, drop = FALSE][[1]]}
+
+#Extract important feature names, use it to only keep important variables in data
+imp.feats<- as.character(pull(arrange(imps,-importance),names))[1:15]
+imp.train<- train[,c(imp.feats,"classe")]
+imp.test<- test[,c(imp.feats,"classe")]
+
+```
+
+Now we'll build our final random forest model.
+
+## Building the Model
+First, we build the model:
 
 ```{r,warning=FALSE,message=FALSE}
 
-fitControl <- trainControl(method = "cv",number = 5)
-#Build the models; number of trees was chosen to reduce the time to build the models
-mod1<- train(classe~., data = train, method = "rf",ntree= 20,trControl = fitControl, allowParallel=TRUE)
-mod2<- train(classe~., method = "gbm", data = train, trControl = fitControl, tuneGrid = expand.grid(n.trees=20, interaction.depth=2, shrinkage=0.1), verbose = FALSE)
+#Build the model; number of trees was chosen to reduce the time to build the model
+mod1<- train(classe~., data = imp.train, method = "rf",ntree= 20, allowParallel=TRUE)
 ```
 
-Next, test the models on the test set:
+Now, test the model on the test set to get an estimate of the out-of-sample error:
 
 ```{r}
 #Make predictions on the test set
-pred1<- predict(mod1,test[,-49])
-pred2<- predict(mod2,test[,-49])
+pred1<- predict(mod1,imp.test[,-16])
 
-#Print the confusion matrix for each models predictions
-confusionMatrix(pred1,test$classe)
-confusionMatrix(pred2,test$classe)
+#Print the confusion matrix for the model
+confusionMatrix(pred1,imp.test$classe)
 ```
 
-The random forest performs better with an out-of-sample error estimate of approximately 0.8%. This model will be used to predict the final test set:
+The has an out-of-sample error estimate of approximately 1.4%. This model will be used to predict the final test set:
 
 ```{r}
-predict(mod1,final.test[,-49])
+predict(mod1,final.test[,-16])
 ```
